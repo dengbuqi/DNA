@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -7,8 +9,8 @@ class NeuralCell(nn.Module):
         super(NeuralCell,self).__init__()
         self.f = nn.Linear(in_features, out_features, bias=bias)
 
-    def _init(self):
-        nn.init.constant_(self.f.weight, 1)
+    def _init(self, w=0.01):
+        nn.init.constant_(self.f.weight, w)
         nn.init.zeros_(self.f.bias)
 
     def setweight(self, weight, bias):
@@ -21,13 +23,13 @@ class NeuralCell(nn.Module):
 
     def culculatepassthrough(self):
         w,b = self.getweight()
-        return (w+b).mean()
+        return torch.abs(w+b).mean()
 
     def forward(self,x):
         return self.f(x)
 
 class NeuralCellEdge(nn.Module):
-    def __init__(self,in_features=1, out_features=1, bias=True, is_init=True) -> None:
+    def __init__(self,in_features=1, out_features=1, bias=True, init_w=None) -> None:
         super(NeuralCellEdge,self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -35,14 +37,14 @@ class NeuralCellEdge(nn.Module):
         self.fs = nn.ModuleList()
         self.device = 'cpu'
 
-        if is_init:
-            self._init()
+        if init_w is not None:
+            self._init(init_w)
         
-    def _init(self):
+    def _init(self,w):
         cell = NeuralCell(in_features=self.in_features, out_features=self.out_features, bias=self.bias)
         self.fs.append(cell)
         for f in self.fs:
-            f._init()
+            f._init(w)
 
     def to(self,device):
         self.device = device
@@ -53,6 +55,11 @@ class NeuralCellEdge(nn.Module):
     def __str__(self):
         return f'{len(self.fs)}'
     
+    def _show_weight(self):
+        for f in self.fs:
+            weight, bias = f.getweight()
+            print(weight, bias)
+
     def culculatepassthrough(self):
         passts = []
         for f in self.fs:
@@ -75,7 +82,8 @@ class NeuralCellEdge(nn.Module):
 
     def delete(self, idx): # delete neural cell
         try:
-            del self.fs[idx]
+            if len(self.fs) > 1:
+                del self.fs[idx]
             # self.fs[idx].pop(idx)
         except Exception as e:
             print(f'delete {idx} cell failed',e)
@@ -97,13 +105,15 @@ class Brain(nn.Module):
         super(Brain,self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.init_w = 1/out_features
         self.edges = nn.ModuleList()
         self.device = 'cpu'
-        self._init()
         
     def _init(self):
+        del self.edges
+        self.edges = nn.ModuleList()
         for i in range(self.in_features):
-            self.edges.append(nn.ModuleList([NeuralCellEdge(1, 1, True) for _ in range(self.out_features)]))
+            self.edges.append(nn.ModuleList([NeuralCellEdge(1, 1, True, init_w=1/self.out_features) for _ in range(self.out_features)]))
     
     def to(self,device):
         self.device = device
@@ -112,33 +122,51 @@ class Brain(nn.Module):
                 e.to(device)
         return self
     
-    def extinction(self, min_th=0.1, max_th=0.6):
+    def extinction(self, min_th=None, max_th=None):
+        if min_th is None:
+            min_th = self.init_w/2
+        if max_th is None:
+            max_th = self.init_w*2
         for es in self.edges:
             for e in es:
                 tps = e.culculatepassthrough()
-                create_list = torch.nonzero(tps>max_th, as_tuple=True)[0]
+                create_list = torch.nonzero(tps>=max_th, as_tuple=True)[0]
                 delete_list = torch.nonzero(tps<min_th, as_tuple=True)[0]
                 e.update(create_list,delete_list)
+        self.init_w = self.init_w/2
 
     def load(self,path):
         pass
     
-    def __str__(self):
-        rstr = 'i->e->o\n'
+    def _get_arch(self):
+        table = np.zeros((len(self.edges), self.out_features), dtype=int)
         for i in range(len(self.edges)):
             for o,e in enumerate(self.edges[i]):
-                rstr+=f'{i}->{e}->{o}|'
-            rstr+='\n'
-        return rstr
+                table[i,o] = str(e)
+        return table
 
-    def forward(self,x, act=F.log_softmax):
+    def __str__(self):
+        # rstr = 'i->e->o\n'
+        # for i in range(len(self.edges)):
+        #     for o,e in enumerate(self.edges[i]):
+        #         rstr+=f'{i}->{e}->{o}|'
+        #     rstr+='\n'
+        # return rstr
+        table = pd.DataFrame(self._get_arch())
+        return table.to_string()
+    
+    def _show_weight(self):
+        for es in self.edges:
+            for e in es:
+                e._show_weight()
+
+    def forward(self,x, act=F.sigmoid):
         sp = tuple(x.shape[:-1])+(self.out_features,)
         ys = torch.zeros(*sp,device=x.device)
-        
         for es in self.edges:
             for i in range(len(es)):
                 ys[...,i:i+1] += es[i](x[...,i:i+1])
-        return act(ys, dim=1)
+        return act(ys)
     
 
 if __name__ == "__main__":
@@ -148,15 +176,13 @@ if __name__ == "__main__":
     m._init()
     m.to(device)
     x = torch.rand(10, 784).to(device)
-
-    # update test
-    m.extinction()
     y = m(x)
-    # print(m)
+    print(m)
     print(y.shape)
-    print(y)
-    m.extinction(min_th=0.6, max_th=1)
+    print(y)        
+    # update test
+    m.extinction(max_th=1/785)
     y = m(x)
-    # print(m)
+    print(m)
     print(y.shape)
     print(y)
