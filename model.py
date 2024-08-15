@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class NeuralCell(nn.Module):
     def __init__(self,in_features=1, out_features=1, bias=True) -> None:
@@ -7,8 +8,8 @@ class NeuralCell(nn.Module):
         self.f = nn.Linear(in_features, out_features, bias=bias)
 
     def _init(self):
-        self.f.weight.data.fill_(1)
-        self.f.bias.data.zero_()
+        nn.init.constant_(self.f.weight, 1)
+        nn.init.zeros_(self.f.bias)
 
     def setweight(self, weight, bias):
         with torch.no_grad():
@@ -17,6 +18,10 @@ class NeuralCell(nn.Module):
 
     def getweight(self):
         return self.f.weight, self.f.bias
+
+    def culculatepassthrough(self):
+        w,b = self.getweight()
+        return (w+b).mean()
 
     def forward(self,x):
         return self.f(x)
@@ -27,18 +32,15 @@ class NeuralCellEdge(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
-        self.fs = []
+        self.fs = nn.ModuleList()
         self.device = 'cpu'
 
         if is_init:
             self._init()
         
     def _init(self):
-        self.fs.append(NeuralCell(
-            in_features=self.in_features,
-            out_features=self.out_features,
-            bias=self.bias,
-            ))
+        cell = NeuralCell(in_features=self.in_features, out_features=self.out_features, bias=self.bias)
+        self.fs.append(cell)
         for f in self.fs:
             f._init()
 
@@ -46,9 +48,16 @@ class NeuralCellEdge(nn.Module):
         self.device = device
         for f in self.fs:
             f.to(device)
+        return self
     
     def __str__(self):
         return f'{len(self.fs)}'
+    
+    def culculatepassthrough(self):
+        passts = []
+        for f in self.fs:
+            passts.append(f.culculatepassthrough())
+        return torch.stack(passts)
     
     def create(self, idx): # create new neural cell
         try:
@@ -72,9 +81,9 @@ class NeuralCellEdge(nn.Module):
             print(f'delete {idx} cell failed',e)
 
     def update(self,create_list, delete_list): # update the neural cell list, create or delete some neural cells base on some rule
-        for c in create_list:
+        for c in sorted(create_list):
             self.create(c)
-        for d in delete_list:
+        for d in sorted(delete_list, reverse=True):
             self.delete(d)
 
     def forward(self,x):
@@ -88,21 +97,28 @@ class Brain(nn.Module):
         super(Brain,self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.edges = []
+        self.edges = nn.ModuleList()
         self.device = 'cpu'
-
+        self._init()
+        
     def _init(self):
         for i in range(self.in_features):
-            self.edges.append([NeuralCellEdge(1,1,True) for j in range(self.out_features)])
+            self.edges.append(nn.ModuleList([NeuralCellEdge(1, 1, True) for _ in range(self.out_features)]))
     
     def to(self,device):
         self.device = device
         for es in self.edges:
             for e in es:
                 e.to(device)
+        return self
     
-    def extinction(self):
-        pass
+    def extinction(self, min_th=0.1, max_th=0.6):
+        for es in self.edges:
+            for e in es:
+                tps = e.culculatepassthrough()
+                create_list = torch.nonzero(tps>max_th, as_tuple=True)[0]
+                delete_list = torch.nonzero(tps<min_th, as_tuple=True)[0]
+                e.update(create_list,delete_list)
 
     def load(self,path):
         pass
@@ -115,14 +131,14 @@ class Brain(nn.Module):
             rstr+='\n'
         return rstr
 
-    def forward(self,x):
-        ys = [0.0]*self.out_features
+    def forward(self,x, act=F.log_softmax):
+        sp = tuple(x.shape[:-1])+(self.out_features,)
+        ys = torch.zeros(*sp,device=x.device)
         
         for es in self.edges:
             for i in range(len(es)):
-                ys[i] += es[i](x[...,i:i+1])
-        ys = torch.cat(ys, dim=-1)
-        return ys
+                ys[...,i:i+1] += es[i](x[...,i:i+1])
+        return act(ys, dim=1)
     
 
 if __name__ == "__main__":
@@ -134,7 +150,13 @@ if __name__ == "__main__":
     x = torch.rand(10, 784).to(device)
 
     # update test
-    m.edges[0][0].update([0,1,2,3], [0,1])
-    print(m)
+    m.extinction()
     y = m(x)
+    # print(m)
     print(y.shape)
+    print(y)
+    m.extinction(min_th=0.6, max_th=1)
+    y = m(x)
+    # print(m)
+    print(y.shape)
+    print(y)
