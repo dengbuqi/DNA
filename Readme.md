@@ -4,9 +4,8 @@ This is my little research project. I try to make a dynamic neural network with 
 
 ## Fire together wire together(Hebbian theory)
 
-```
-    Let us assume that the persistence or repetition of a reverberatory activity (or "trace") tends to induce lasting cellular changes that add to its stability. ... When an axon of cell A is near enough to excite a cell B and repeatedly or persistently takes part in firing it, some growth process or metabolic change takes place in one or both cells such that A’s efficiency, as one of the cells firing B, is increased. 
-```
+Let us assume that the persistence or repetition of a reverberatory activity (or "trace") tends to induce lasting cellular changes that add to its stability. ... When an axon of cell A is near enough to excite a cell B and repeatedly or persistently takes part in firing it, some growth process or metabolic change takes place in one or both cells such that A’s efficiency, as one of the cells firing B, is increased. 
+    
 -- From [Hebbian theory](https://en.wikipedia.org/wiki/Hebbian_theory)
 
 So, In my understanding, for a AI model neural, let's say the assumption of **'the persistence or repetition of a reverberatory activity'** is the training process, the **'cell'** is a neural structure int the model, **'When an axon of cell A is near enough to excite a cell B and repeatedly or persistently takes part in firing it, some growth process or metabolic change takes place in one or both cells such that A’s efficiency, as one of the cells firing B, is increased.'** means if neural A is activated, A will active(fire) neural B sequently. 
@@ -20,10 +19,13 @@ So. In my idea, neural cell can be assumed as a weighted signal function minus a
 $$
 I=C_m \frac{\mathrm{d} V_m}{\mathrm{~d} t}+g_K\left(V_m-V_K\right)+g_{N a}\left(V_m-V_{N a}\right)+g_l\left(V_m-V_l\right)
 $$
+
 **So, our neural cell can be simplified as ->**
+
 $$
 I=wV_m-b
 $$
+
 Yes, we can also replace thie simple function to a complicate function such as [KAN](https://arxiv.org/html/2404.19756v1) model.
 
 
@@ -42,12 +44,15 @@ which means the initialization will be:
 $$
 w_A = 0.5 \times w_A;
 $$
+
 $$
 b_A = b_A;
 $$
+
 $$
 w_B = 0.5 \times w_B;
 $$
+
 $$
 b_B = 0;
 $$
