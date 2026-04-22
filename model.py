@@ -22,15 +22,17 @@ class NeuralCell(nn.Module):
         return self.f.weight, self.f.bias
 
     def culculatepassthrough(self):
-        w,b = self.getweight()
-        return torch.abs(w+b).mean()
+        w, b = self.getweight()
+        # According to Readme: I = wV_m - b. Passthrough is related to the magnitude of weights.
+        # Using L1 norm of weight and bias as a proxy for "passthrough" or activity potential.
+        return torch.abs(w).mean() + torch.abs(b).mean()
 
     def forward(self,x):
         return self.f(x)
 
 class NeuralCellEdge(nn.Module):
-    def __init__(self,in_features=1, out_features=1, bias=True, init_w=None) -> None:
-        super(NeuralCellEdge,self).__init__()
+    def __init__(self, in_features=1, out_features=1, bias=True, init_w=None) -> None:
+        super(NeuralCellEdge, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -40,11 +42,11 @@ class NeuralCellEdge(nn.Module):
         if init_w is not None:
             self._init(init_w)
         
-    def _init(self,w):
+    def _init(self, w):
+        # Initialize with one cell that maps in_features to out_features
         cell = NeuralCell(in_features=self.in_features, out_features=self.out_features, bias=self.bias)
         self.fs.append(cell)
-        for f in self.fs:
-            f._init(w)
+        cell._init(w)
 
     def to(self,device):
         self.device = device
@@ -68,17 +70,20 @@ class NeuralCellEdge(nn.Module):
     
     def create(self, idx): # create new neural cell
         try:
-            w,b = self.fs[idx].getweight()
-            self.fs[idx].setweight(w/2,b/2)
+            parent_cell = self.fs[idx]
+            w, b = parent_cell.getweight()
+            # Readme: w_A = 0.5 * w_A; w_B = 0.5 * w_A (initially); b_B = 0
+            parent_cell.setweight(w / 2, b)
+            
             newf = NeuralCell(
                 in_features=self.in_features,
                 out_features=self.out_features,
                 bias=self.bias,
-                ).to(self.device)
-            newf.setweight(w/2,b/2)
+            ).to(self.device)
+            newf.setweight(w / 2, torch.zeros_like(b))
             self.fs.append(newf)
         except Exception as e:
-            print(f'Create {idx} cell failed',e)
+            print(f'Create {idx} cell failed', e)
 
     def delete(self, idx): # delete neural cell
         try:
@@ -101,25 +106,26 @@ class NeuralCellEdge(nn.Module):
         return y
 
 class Brain(nn.Module):
-    def __init__(self,in_features=784, out_features=10) -> None: # default 784 ,10 is Mnist dataset input output
-        super(Brain,self).__init__()
+    def __init__(self, in_features=784, out_features=10) -> None: # default 784 ,10 is Mnist dataset input output
+        super(Brain, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.init_w = 1/out_features
+        self.init_w = 1.0  # Readme says w=1, b=0 initially
         self.edges = nn.ModuleList()
         self.device = 'cpu'
         
     def _init(self):
         del self.edges
         self.edges = nn.ModuleList()
+        # Each edge represents a connection from one input neuron to all output neurons
         for i in range(self.in_features):
-            self.edges.append(nn.ModuleList([NeuralCellEdge(1, 1, True, init_w=1/self.out_features) for _ in range(self.out_features)]))
+            # Create a NeuralCellEdge which contains multiple parallel NeuralCells
+            self.edges.append(NeuralCellEdge(1, self.out_features, bias=True, init_w=self.init_w))
     
     def to(self,device):
         self.device = device
         for es in self.edges:
-            for e in es:
-                e.to(device)
+            es.to(device)
         return self
     
     def extinction(self, min_th=None, max_th=None):
@@ -128,11 +134,10 @@ class Brain(nn.Module):
         if max_th is None:
             max_th = self.init_w*2
         for es in self.edges:
-            for e in es:
-                tps = e.culculatepassthrough()
-                create_list = torch.nonzero(tps>=max_th, as_tuple=True)[0]
-                delete_list = torch.nonzero(tps<min_th, as_tuple=True)[0]
-                e.update(create_list,delete_list)
+            tps = es.culculatepassthrough()
+            create_list = torch.nonzero(tps>=max_th, as_tuple=True)[0]
+            delete_list = torch.nonzero(tps<min_th, as_tuple=True)[0]
+            es.update(create_list,delete_list)
         self.init_w = self.init_w/2
 
     def load(self,path):
@@ -140,9 +145,9 @@ class Brain(nn.Module):
     
     def _get_arch(self):
         table = np.zeros((len(self.edges), self.out_features), dtype=int)
-        for i in range(len(self.edges)):
-            for o,e in enumerate(self.edges[i]):
-                table[i,o] = str(e)
+        for i, es in enumerate(self.edges):
+            # es is a NeuralCellEdge object
+            table[i,:] = len(es.fs)
         return table
 
     def __str__(self):
@@ -157,15 +162,21 @@ class Brain(nn.Module):
     
     def _show_weight(self):
         for es in self.edges:
-            for e in es:
-                e._show_weight()
+            es._show_weight()
 
-    def forward(self,x, act=F.sigmoid):
-        sp = tuple(x.shape[:-1])+(self.out_features,)
-        ys = torch.zeros(*sp,device=x.device)
-        for es in self.edges:
-            for i in range(len(es)):
-                ys[...,i:i+1] += es[i](x[...,i:i+1])
+    def forward(self, x, act=F.sigmoid):
+        # x shape: [batch_size, in_features]
+        # We want to process each input feature through its corresponding NeuralCellEdge
+        # NeuralCellEdge expects input of shape [batch_size, 1] and outputs [batch_size, out_features]
+        
+        batch_size = x.shape[0]
+        ys = torch.zeros(batch_size, self.out_features, device=x.device)
+        
+        for i, edge in enumerate(self.edges):
+            # Extract the i-th feature for all samples in the batch
+            inp = x[:, i:i+1]
+            ys += edge(inp)
+            
         return act(ys)
     
 
