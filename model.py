@@ -1,160 +1,178 @@
 """
-DNA v3 — Overproduction + Energy Budget model.
+DNA v3 — Overproduction + Energy Budget + Lateral Inhibition.
 
 Biology-inspired principles:
   1. Overproduction: each edge starts with many cells, competition decides who lives.
-  2. Energy budget: cells have energy that depletes over time and is replenished by activity.
-  3. Zero vitality thresholds — everything is governed by energy economics.
+  2. Energy budget: cells have energy that depletes and is replenished by activity.
+  3. Lateral inhibition: within an edge, cells compete via softmax — winner gets activation,
+     losers are suppressed. This drives specialization toward different output classes.
 """
 
 import torch
-import numpy as np
+import torch.nn.functional as F
 
 
 class Brain(torch.nn.Module):
     """
-    DNA v3 — Overproduction + Energy Budget.
+    DNA v3 + Lateral Inhibition.
+
+    Key change: each cell within an edge competes for each output class.
+    On a given (pixel, class) pair, only the strongest cell's signal passes through,
+    others are attenuated by softmax competition.
 
     Architecture:
       Weight: [in_features, cells_per_edge, out_features]
       Energy: [in_features, cells_per_edge]
 
-    Per epoch:
-      - Forward pass collects cell activations
-      - Energy update: base_cost + activation_reward - inhibition_penalty
-      - Cells with energy <= 0: marked dead, removed
-      - Cells with energy > split_threshold: divide
-
-    Forward: sum over cells, normalize, sigmoid.
-    Training: standard BCE + backprop.
+    Forward with inhibition:
+      - For each (pixel, class), compute raw cell outputs
+      - Apply softmax competition across cells within each edge
+      - Only the winning cell's output contributes to the final sum
+      - This drives cells to specialize: each cell "owns" certain classes
     """
 
     def __init__(self, in_features=784, out_features=10, initial_cells=10,
                  max_cells=32, energy_init=100, energy_split=150,
-                 base_cost=1.0, activation_reward=0.5):
+                 base_cost=1.0, activation_reward=1.0,
+                 inhibition_strength=3.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.max_cells = max_cells
-        self.total_cell_slots = max_cells * 2  # fixed max allocation
+        self.total_cell_slots = max_cells * 2
 
-        # Energy parameters
         self.energy_init = energy_init
         self.energy_split = energy_split
         self.base_cost = base_cost
         self.activation_reward = activation_reward
+        self.inhibition_strength = inhibition_strength  # softmax temperature (lower=sharper)
 
         # Weight: [in_features, cells, out_features]
         self.weight = torch.nn.Parameter(
             torch.zeros(in_features, self.total_cell_slots, out_features))
 
-        # Energy: [in_features, cells]  — not a parameter, just state
         self.register_buffer('_energy', torch.full(
             (in_features, self.total_cell_slots), energy_init, dtype=torch.float))
 
-        # Alive mask: [in_features, cells]
         self.register_buffer('_alive', torch.zeros(
             in_features, self.total_cell_slots, dtype=torch.bool))
 
-        # Track how many cells per edge are actually in use
-        self.active_count = torch.nn.Parameter(
-            torch.full((in_features,), initial_cells, dtype=torch.long), requires_grad=False)
-
-        # Activation buffer (accumulated per epoch)
         self.register_buffer('_activation_sum',
             torch.zeros(in_features, self.total_cell_slots))
 
-        # Initialize first `initial_cells` per edge as alive
         self._alive[:, :initial_cells] = True
-
         self._init_weights()
 
     def _init_weights(self):
         torch.nn.init.normal_(self.weight, mean=0.0, std=0.1)
 
-    # ---- Forward ----
+    # ---- Forward with Lateral Inhibition ----
 
     def forward(self, x, act=torch.sigmoid):
         """
-        x: [batch, in_features] or [batch, 1, in_features]
+        x: [batch, in_features]
         Returns: [batch, out_features]
+
+        For each pixel, cells compete via softmax over the output dimension.
+        Only the cell(s) with the strongest response to each class contribute.
         """
-        # Handle [batch, 1, in_features] from Flatten preserving channel dim
         if x.dim() == 3 and x.shape[1] == 1:
             x = x.squeeze(1)
-        batch = x.shape[0]
-        # Weighted sum over all cells: [batch, in_features, cells, out_features]
-        # x: [batch, in_features, 1, 1]
-        # weight: [1, in_features, cells, out_features]
-        x_exp = x.unsqueeze(-1).unsqueeze(-1)  # [batch, in_features, 1, 1]
-        w_exp = self.weight.unsqueeze(0)         # [1, in_features, cells, out_features]
-        # Elementwise multiply then sum over input features
-        # out: [batch, cells, out_features]
-        # x: [batch, in_features], weight: [in_features, cells, out_features]
-        out = torch.einsum('bi,icd->bcd', x, self.weight)
 
-        # Only alive cells contribute
-        alive_mask = self._alive.unsqueeze(0)    # [1, in_features, cells]
-        # Sum over cells for each input feature, then average
-        # Weighted by alive: [batch, cells, out_features] -> sum over cells -> [batch, out_features]
-        # But we need per-edge handling... flatten instead:
-        # After T steps: classification based on first-to-spike or most-spikes
-        # Sum over cells dimension: [batch, out_features]
-        out_sum = out.sum(dim=1)  # [batch, out_features]
+        # Raw cell outputs: [batch, cells, out_features]
+        cell_out = torch.einsum('bi,icd->bcd', x, self.weight)
 
-        # Normalize by number of edges (not cells, keeps magnitude stable)
-        return act(out_sum / self.in_features)
+        # Apply alive mask: dead cells have output 0
+        alive_mask = self._alive.unsqueeze(0).float()  # [1, in_features, cells]
+        # cell_out is [batch, cells, out_features] — but cells = in_features * total_cell_slots
+        # Wait — this is wrong. cell_out dim 1 = cells (all cells across ALL edges),
+        # but alive_mask dim 1 = in_features.
+        # We need to keep the [in_features, cells] structure throughout.
 
-    # ---- Track Activations ----
+        # Let's restructure: compute per-edge output, then apply inhibition per-edge.
+        # Weight: [in_features, cells, out_features]
+        # We want: for each edge (in_feat), for each batch, for each class:
+        #   raw = x[b, feat] * weight[feat, cell, class]  [cells, out_features]
+        #   competitive = softmax(raw * inhibition_strength, dim=0) * raw
+        #   sum over cells -> [out_features]
+
+        B = x.shape[0]
+        edge_outputs = torch.zeros(B, self.out_features, device=x.device)
+
+        for feat in range(self.in_features):
+            # Get alive cells for this edge
+            alive = self._alive[feat]  # [total_cell_slots]
+            if not alive.any():
+                continue
+
+            # Raw contribution of each cell to each class: [batch, n_alive, out_features]
+            feat_weight = self.weight[feat, alive, :]  # [n_alive, out_features]
+            px_val = x[:, feat:feat+1]  # [batch, 1]
+            raw = px_val.unsqueeze(-1) * feat_weight.unsqueeze(0)  # [batch, n_alive, out_features]
+
+            # Lateral inhibition: softmax competition across cells (dim=1)
+            # For each output class, cells compete — strongest gets amplified, others suppressed
+            # Apply softmax with temperature
+            competitive = F.softmax(raw * self.inhibition_strength, dim=1)
+            # Winning cells' output passes through
+            inhibited = competitive * raw  # [batch, n_alive, out_features]
+
+            # Sum over cells to get edge contribution to each class
+            edge_outputs += inhibited.sum(dim=1)  # [batch, out_features]
+
+        return act(edge_outputs / self.in_features)
+
+    # ---- Track Activations (with inhibition awareness) ----
 
     def track_activations(self, x):
-        """Accumulate activations per cell for energy update."""
+        """Accumulate activations per cell. Only cells that 'won' get rewarded."""
+        if x.dim() == 3 and x.shape[1] == 1:
+            x = x.squeeze(1)
+
         with torch.no_grad():
-            # Handle [batch, 1, in_features]
-            if x.dim() == 3 and x.shape[1] == 1:
-                x = x.squeeze(1)
-            # Cell output: [batch, cells, out_features]
-            cell_out = torch.einsum('bi,icd->bcd', x, self.weight).abs()
-            # Mean absolute activation per cell, per sample
-            act = cell_out.mean(dim=(0, 2))  # [cells] — average over batch & out_features
-            # Expand to [in_features, cells]
-            self._activation_sum += act.unsqueeze(0).expand(self.in_features, -1)
+            B = x.shape[0]
+            batch_act = torch.zeros_like(self._activation_sum)
+
+            for feat in range(self.in_features):
+                alive = self._alive[feat]
+                if not alive.any():
+                    continue
+
+                feat_weight = self.weight[feat, alive, :]  # [n_alive, out_features]
+                px_val = x[:, feat:feat+1]
+                raw = px_val.unsqueeze(-1) * feat_weight.unsqueeze(0)  # [B, n_alive, out_features]
+
+                # Competition — same as forward
+                competitive = F.softmax(raw * self.inhibition_strength, dim=1)
+                inhibited = competitive * raw
+
+                # Reward each cell by its inhibited output (winner gets full, losers get little)
+                # Mean over batch and out_features
+                cell_reward = inhibited.mean(dim=(0, 2))  # [n_alive]
+                batch_act[feat, alive] = cell_reward
+
+            self._activation_sum += batch_act
 
     # ---- Energy Update ----
 
     def update_energy(self):
-        """Update energy for all cells based on epoch activity."""
         with torch.no_grad():
-            # Reward: average activation × reward multiplier
-            # _activation_sum is now sum of per-sample means
             reward = self._activation_sum * self.activation_reward
-
-            # Cost: base cost for all alive cells (constant per epoch)
             cost = self.base_cost
-
-            # Energy change
-            energy_change = reward - cost
-            self._energy += energy_change
-
-            # Clamp: energy can't go negative or above split threshold * 2
+            self._energy += (reward - cost)
             self._energy.clamp_(0, self.energy_split * 2)
-
-            # Reset activation for next epoch
             self._activation_sum.zero_()
 
     # ---- Structural Update ----
 
     def structural_update(self):
-        """
-        Remove dead cells (energy == 0), split rich cells (energy > split_threshold).
-        """
         with torch.no_grad():
-            # ---- Kill: energy == 0 ----
+            # Kill: energy <= 0
             dead = (self._energy <= 0) & self._alive
             if dead.any():
                 self._alive[dead] = False
 
-            # ---- Split: energy > split_threshold AND below max_cells ----
+            # Split: energy > split_threshold
             for feat in range(self.in_features):
                 alive_indices = torch.where(self._alive[feat])[0]
                 n_alive = len(alive_indices)
@@ -162,25 +180,20 @@ class Brain(torch.nn.Module):
                 if n_alive >= self.max_cells:
                     continue
 
-                # Find cells above split threshold
                 rich = torch.where((self._energy[feat] > self.energy_split) & self._alive[feat])[0]
                 for idx in rich:
                     if n_alive >= self.max_cells:
                         break
-                    # Split: find a dead slot
                     dead_slots = torch.where(~self._alive[feat])[0]
                     if len(dead_slots) == 0:
-                        break  # no free slots
+                        break
                     new_idx = dead_slots[0].item()
 
-                    # Copy parent weight with perturbation
                     parent_w = self.weight[feat, idx, :].clone()
                     self.weight[feat, new_idx, :] = parent_w + torch.randn_like(parent_w) * 0.05
                     self._energy[feat, new_idx] = self.energy_init
                     self._alive[feat, new_idx] = True
-                    # Parent loses some energy
                     self._energy[feat, idx] = self._energy[feat, idx] * 0.5
-
                     n_alive += 1
 
     def get_n_cells(self):
@@ -189,18 +202,17 @@ class Brain(torch.nn.Module):
 
 if __name__ == '__main__':
     torch.manual_seed(42)
-    m = Brain(in_features=28, out_features=5, initial_cells=10)
-    print(f"Parameters: {sum(p.numel() for p in m.parameters())}")
-    print(f"Alive cells: {m.get_n_cells()}")
+    m = Brain(in_features=28, out_features=5, initial_cells=10,
+              inhibition_strength=3.0)
+    print(f"Params: {sum(p.numel() for p in m.parameters())}")
+    print(f"Alive: {m.get_n_cells()}")
 
     x = torch.rand(4, 28)
     y = m(x)
-    print(f"Output shape: {y.shape}")
+    print(f"Output: {y.shape}")
 
-    # Simulate training step
     m.track_activations(x)
     m.update_energy()
-    print(f"Energy range: [{m._energy.min().item():.1f}, {m._energy.max().item():.1f}]")
-    print(f"Alive before structural update: {m.get_n_cells()}")
+    print(f"Energy: [{m._energy.min().item():.1f}, {m._energy.max().item():.1f}]")
     m.structural_update()
     print(f"Alive after: {m.get_n_cells()}")
