@@ -36,6 +36,7 @@ class Brain(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.max_cells = max_cells
+        self.total_cell_slots = max_cells * 2  # fixed max allocation
 
         # Energy parameters
         self.energy_init = energy_init
@@ -43,20 +44,28 @@ class Brain(torch.nn.Module):
         self.base_cost = base_cost
         self.activation_reward = activation_reward
 
-        # Number of cells per edge (tracked dynamically)
-        self.n_cells = initial_cells
-
         # Weight: [in_features, cells, out_features]
-        self.weight = torch.nn.Parameter(torch.zeros(in_features, initial_cells, out_features))
+        self.weight = torch.nn.Parameter(
+            torch.zeros(in_features, self.total_cell_slots, out_features))
 
         # Energy: [in_features, cells]  — not a parameter, just state
-        self.register_buffer('_energy', torch.full((in_features, initial_cells), energy_init, dtype=torch.float))
+        self.register_buffer('_energy', torch.full(
+            (in_features, self.total_cell_slots), energy_init, dtype=torch.float))
 
         # Alive mask: [in_features, cells]
-        self.register_buffer('_alive', torch.ones(in_features, initial_cells, dtype=torch.bool))
+        self.register_buffer('_alive', torch.zeros(
+            in_features, self.total_cell_slots, dtype=torch.bool))
+
+        # Track how many cells per edge are actually in use
+        self.active_count = torch.nn.Parameter(
+            torch.full((in_features,), initial_cells, dtype=torch.long), requires_grad=False)
 
         # Activation buffer (accumulated per epoch)
-        self.register_buffer('_activation_sum', torch.zeros(in_features, initial_cells))
+        self.register_buffer('_activation_sum',
+            torch.zeros(in_features, self.total_cell_slots))
+
+        # Initialize first `initial_cells` per edge as alive
+        self._alive[:, :initial_cells] = True
 
         self._init_weights()
 
@@ -67,25 +76,30 @@ class Brain(torch.nn.Module):
 
     def forward(self, x, act=torch.sigmoid):
         """
-        x: [batch, in_features]
+        x: [batch, in_features] or [batch, 1, in_features]
         Returns: [batch, out_features]
         """
+        # Handle [batch, 1, in_features] from Flatten preserving channel dim
+        if x.dim() == 3 and x.shape[1] == 1:
+            x = x.squeeze(1)
         batch = x.shape[0]
         # Weighted sum over all cells: [batch, in_features, cells, out_features]
         # x: [batch, in_features, 1, 1]
         # weight: [1, in_features, cells, out_features]
         x_exp = x.unsqueeze(-1).unsqueeze(-1)  # [batch, in_features, 1, 1]
         w_exp = self.weight.unsqueeze(0)         # [1, in_features, cells, out_features]
-        out = (x_exp * w_exp).sum(dim=1)         # [batch, cells, out_features]
+        # Elementwise multiply then sum over input features
+        # out: [batch, cells, out_features]
+        # x: [batch, in_features], weight: [in_features, cells, out_features]
+        out = torch.einsum('bi,icd->bcd', x, self.weight)
 
         # Only alive cells contribute
         alive_mask = self._alive.unsqueeze(0)    # [1, in_features, cells]
         # Sum over cells for each input feature, then average
         # Weighted by alive: [batch, cells, out_features] -> sum over cells -> [batch, out_features]
         # But we need per-edge handling... flatten instead:
-        # All cells across all edges: [batch, in_features * cells, out_features]
-        B, C, O = out.shape
-        # Sum across all edges * cells: [batch, out_features]
+        # After T steps: classification based on first-to-spike or most-spikes
+        # Sum over cells dimension: [batch, out_features]
         out_sum = out.sum(dim=1)  # [batch, out_features]
 
         # Normalize by number of edges (not cells, keeps magnitude stable)
@@ -96,26 +110,26 @@ class Brain(torch.nn.Module):
     def track_activations(self, x):
         """Accumulate activations per cell for energy update."""
         with torch.no_grad():
-            # Cell output for this batch: [batch, in_features, cells, out_features]
-            x_exp = x.unsqueeze(-1).unsqueeze(-1)
-            w_exp = self.weight.unsqueeze(0)
-            cell_out = (x_exp * w_exp).abs()  # [batch, in_features, cells, out_features]
-            # Sum over batch and out_features
-            act = cell_out.sum(dim=(0, 3))  # [in_features, cells]
-            self._activation_sum += act
+            # Handle [batch, 1, in_features]
+            if x.dim() == 3 and x.shape[1] == 1:
+                x = x.squeeze(1)
+            # Cell output: [batch, cells, out_features]
+            cell_out = torch.einsum('bi,icd->bcd', x, self.weight).abs()
+            # Mean absolute activation per cell, per sample
+            act = cell_out.mean(dim=(0, 2))  # [cells] — average over batch & out_features
+            # Expand to [in_features, cells]
+            self._activation_sum += act.unsqueeze(0).expand(self.in_features, -1)
 
     # ---- Energy Update ----
 
     def update_energy(self):
         """Update energy for all cells based on epoch activity."""
         with torch.no_grad():
-            # Reward: activation / max_possible
-            # activation_sum is summed over all batches
-            # Normalize by max possible activation (batch_size * out_features)
-            # We'll just use raw activation_sum scaled by reward
+            # Reward: average activation × reward multiplier
+            # _activation_sum is now sum of per-sample means
             reward = self._activation_sum * self.activation_reward
 
-            # Cost: base cost for all alive cells
+            # Cost: base cost for all alive cells (constant per epoch)
             cost = self.base_cost
 
             # Energy change
@@ -149,61 +163,25 @@ class Brain(torch.nn.Module):
                     continue
 
                 # Find cells above split threshold
-                rich = torch.where(self._energy[feat] > self.energy_split)[0]
+                rich = torch.where((self._energy[feat] > self.energy_split) & self._alive[feat])[0]
                 for idx in rich:
                     if n_alive >= self.max_cells:
                         break
-                    # Split: create a new cell
-                    new_idx = self._add_cell(feat, idx.item())
-                    if new_idx is not None:
-                        n_alive += 1
+                    # Split: find a dead slot
+                    dead_slots = torch.where(~self._alive[feat])[0]
+                    if len(dead_slots) == 0:
+                        break  # no free slots
+                    new_idx = dead_slots[0].item()
 
-            # ---- Prune dead cells (compactify) ----
-            self._prune_dead()
+                    # Copy parent weight with perturbation
+                    parent_w = self.weight[feat, idx, :].clone()
+                    self.weight[feat, new_idx, :] = parent_w + torch.randn_like(parent_w) * 0.05
+                    self._energy[feat, new_idx] = self.energy_init
+                    self._alive[feat, new_idx] = True
+                    # Parent loses some energy
+                    self._energy[feat, idx] = self._energy[feat, idx] * 0.5
 
-    def _add_cell(self, feat, parent_idx):
-        """Add a new cell to edge `feat`, inheriting from parent at `parent_idx`."""
-        # Find first dead slot or expand
-        dead_slots = torch.where(~self._alive[feat])[0]
-        if len(dead_slots) > 0:
-            new_idx = dead_slots[0].item()
-        else:
-            # Need to expand
-            old_size = self.weight.shape[1]
-            if old_size >= self.max_cells * 2:
-                return None
-            new_size = old_size * 2
-            # Expand weight
-            new_weight = torch.zeros(self.in_features, new_size, self.out_features, device=self.weight.device)
-            new_weight[:, :old_size, :] = self.weight.data
-            self.weight = torch.nn.Parameter(new_weight)
-            # Expand buffers
-            new_energy = torch.full((self.in_features, new_size), self.energy_init, device=self._energy.device)
-            new_energy[:, :old_size] = self._energy
-            self._energy = new_energy
-            new_alive = torch.zeros(self.in_features, new_size, dtype=torch.bool, device=self._alive.device)
-            new_alive[:, :old_size] = self._alive
-            self._alive = new_alive
-            new_act = torch.zeros(self.in_features, new_size, device=self._activation_sum.device)
-            new_act[:, :old_size] = self._activation_sum
-            self._activation_sum = new_act
-            new_idx = old_size  # first new slot
-
-        # Copy parent weight with perturbation
-        parent_w = self.weight[feat, parent_idx, :].clone()
-        self.weight[feat, new_idx, :] = parent_w + torch.randn_like(parent_w) * 0.05
-        # Energy: half of parent's excess
-        self._energy[feat, new_idx] = self.energy_init
-        self._alive[feat, new_idx] = True
-        # Parent loses some energy for the split
-        self._energy[feat, parent_idx] /= 2
-
-        return new_idx
-
-    def _prune_dead(self):
-        """Compactify: remove dead cells to free slots."""
-        # Simply reset the dead cells' energy to 0 and keep them as free slots
-        pass  # _add_cell reuses dead slots
+                    n_alive += 1
 
     def get_n_cells(self):
         return self._alive.sum().item()
