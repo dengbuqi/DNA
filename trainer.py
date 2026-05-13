@@ -1,176 +1,114 @@
+"""
+DNA v3 Trainer — Overproduction + Energy Budget.
+
+Training loop:
+  1. Forward pass (BCE + backprop — standard PyTorch)
+  2. Track activations per cell
+  3. Epoch end: energy update, structural update (split rich, remove dead)
+"""
+
 import torch
-import numpy as np
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from model import Brain
 
 
-class FlattenTransform:
-    def __call__(self, x):
-        return torch.flatten(x)
-
-
-class EarlyStopping:
-    """Used in reverse: trigger extinction when loss plateaus"""
-
-    def __init__(self, patience=5, verbose=False):
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_loss = np.inf
-        self.early_stop = False
-
-    def reset(self):
-        self.counter = 0
-        self.best_loss = np.inf
-        self.early_stop = False
-
-    def __call__(self, val_loss, diff=0.01):
-        if val_loss < self.best_loss - diff:
-            self.best_loss = val_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.verbose:
-                print(f'  Plateau counter: {self.counter}/{self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-
-
-# --- Hyperparameters ---
 args = {
     'batch_size': 256,
-    'test_batch_size': 1000,
-    'epochs': 30,
+    'epochs': 20,
     'lr': 0.01,
     'momentum': 0.5,
-    'seed': 1,
-    'log_interval': 10,
     'patience': 3,
+    'initial_cells': 10,
+    'max_cells': 32,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
-
-# --- Data Loaders ---
-kwargs = {'num_workers': 0, 'pin_memory': True} if torch.cuda.is_available() else {}
 
 train_loader = torch.utils.data.DataLoader(
     datasets.MNIST('/data/MNIST', train=True, download=True,
                    transform=transforms.Compose([
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,)),
-                       FlattenTransform()
+                       torch.nn.Flatten(),
                    ])),
-    batch_size=args['batch_size'], shuffle=True, **kwargs)
+    batch_size=args['batch_size'], shuffle=True, num_workers=0)
 
 test_loader = torch.utils.data.DataLoader(
     datasets.MNIST('/data/MNIST', train=False,
                    transform=transforms.Compose([
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,)),
-                       FlattenTransform()
+                       torch.nn.Flatten(),
                    ])),
-    batch_size=args['test_batch_size'], shuffle=True, **kwargs)
+    batch_size=args['test_batch_size'] if 'test_batch_size' in args else 1000,
+    shuffle=False, num_workers=0)
 
 
-def train(epoch, model, optimizer):
+def train_epoch(epoch, model, optimizer):
     model.train()
     total_loss = 0
     correct = 0
     total_samples = 0
 
-    for batch_idx, (data, target_raw) in enumerate(train_loader):
-        data, target_raw = data.to(device, non_blocking=True), target_raw.to(device, non_blocking=True)
-        target = F.one_hot(target_raw, 10).float()
+    for data, target in train_loader:
+        data, target = data.to(device), target.to(device)
 
         optimizer.zero_grad()
         output = model(data)
-        loss = F.binary_cross_entropy(output, target)
+        loss = F.binary_cross_entropy(output, F.one_hot(target, 10).float())
         loss.backward()
-
-        # Track gradient norms for vitality calculation
-        model.track_backward()
-
         optimizer.step()
 
+        # Track cell activations for energy update
+        model.track_activations(data)
+
         total_loss += loss.item() * data.size(0)
-        pred = output.argmax(dim=1, keepdim=True)
-        correct += pred.eq(target_raw.view_as(pred)).sum().item()
+        pred = output.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
         total_samples += data.size(0)
 
     avg_loss = total_loss / total_samples
     accuracy = 100. * correct / total_samples
-    print(f'[Epoch {epoch}] Train Loss: {avg_loss:.4f} | Accuracy: {accuracy:.2f}%')
+    print(f'[Epoch {epoch}] Loss: {avg_loss:.4f} Acc: {accuracy:.2f}%')
     return avg_loss
 
 
 def test(model):
     model.eval()
-    test_loss = 0
     correct = 0
-    total_samples = 0
-
+    total = 0
     with torch.no_grad():
-        for data, target_raw in test_loader:
-            data, target_raw = data.to(device, non_blocking=True), target_raw.to(device, non_blocking=True)
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
             output = model(data)
-            loss = F.binary_cross_entropy(
-                output, F.one_hot(target_raw, 10).float(), reduction='mean'
-            )
-            test_loss += loss.item() * data.size(0)
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target_raw.view_as(pred)).sum().item()
-            total_samples += data.size(0)
-
-    avg_loss = test_loss / total_samples
-    accuracy = 100. * correct / total_samples
-    print(f'[Test]  Avg Loss: {avg_loss:.4f} | Accuracy: {accuracy:.2f}%')
-    return avg_loss
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
+    return 100. * correct / total
 
 
 if __name__ == '__main__':
-    model = Brain(in_features=784, out_features=10)
-    model._init()
-    model.to(device)
-    first_total = sum(len(es.fs) for es in model.edges)
-    print(f'Initial model: {first_total} cells ({model.in_features} edges x 1 cell)')
-    print()
+    model = Brain(
+        in_features=784, out_features=10,
+        initial_cells=args['initial_cells'],
+        max_cells=args['max_cells'],
+    ).to(device)
+    print(f'Initial alive cells: {model.get_n_cells()}')
 
     optimizer = optim.SGD(model.parameters(), lr=args['lr'], momentum=args['momentum'])
-    early_stopping = EarlyStopping(patience=args['patience'], verbose=False)
 
     for epoch in range(1, args['epochs'] + 1):
-        # Phase 1: Reset vitality stats for this epoch
-        model.reset_vitality()
+        train_epoch(epoch, model, optimizer)
 
-        # Phase 2: Train
-        train_loss = train(epoch, model, optimizer)
-
-        # Phase 3: Evaluate
-        val_loss = test(model)
-
-        # Phase 4: Structural update based on vitality
+        # Energy + structural update
+        model.update_energy()
         model.structural_update()
 
-        # Phase 5: Check extinction trigger (loss plateau)
-        early_stopping(val_loss)
-        if early_stopping.early_stop:
-            print(f'\n  *** Loss plateau detected! Triggering Extinction... ***')
-            model.extinction()
-            optimizer = optim.SGD(model.parameters(), lr=args['lr'], momentum=args['momentum'])
-            early_stopping.reset()
-            print()
+        print(f'  [Arch] Alive cells: {model.get_n_cells()}')
 
-        # Log architecture summary
-        total_cells = sum(len(es.fs) for es in model.edges)
-        dying_cells = sum(1 for es in model.edges for f in es.fs if f.dying)
-        grace_cells = sum(1 for es in model.edges for f in es.fs if f.grace_remaining > 0)
-        hier_edges = sum(1 for es in model.edges if es.is_hierarchical)
-        avg_per_edge = total_cells / max(len(model.edges), 1)
-        print(f'  [Arch] {total_cells} cells ({dying_cells} dying, {grace_cells} grace) | '
-              f'{hier_edges} hierarchical | Avg {avg_per_edge:.2f} cells/edge | '
-              f'Threshold {model.vitality_threshold:.6f}')
+        test_acc = test(model)
+        print(f'  [Test] Acc: {test_acc:.2f}%')
         print()
