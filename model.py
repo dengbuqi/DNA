@@ -1,7 +1,17 @@
 """
-DNA v7 — Two-phase learning:
-  Phase 1: Local Hebbian with target (warm start)
-  Phase 2: Pure dopamine + eligibility trace — no target signals
+DNA v8 — Temporal Difference dopamine learning.
+
+Key insight from v7 failure:
+  Global average dopamine (0.34) is too weak and uniform.
+  All cells get the same small positive signal — no differentiation.
+
+TD fix:
+  dopamine = current_accuracy - expected_accuracy
+  If accuracy = 71% and expected = 68% -> dopamine = +0.03 (good surprise)
+  If accuracy = 68% and expected = 68% -> dopamine = 0 (expected)
+  If accuracy = 65% and expected = 68% -> dopamine = -0.03 (bad surprise)
+
+  This captures deviations from expectation, not absolute performance.
 """
 
 import torch
@@ -20,6 +30,10 @@ class Brain(torch.nn.Module):
         self.lr = lr
         self.trace_decay = trace_decay
 
+        # TD learning state
+        self.expected_accuracy = 0.10  # start at random guess (10%)
+        self.td_alpha = 0.1  # learning rate for expected accuracy update
+
         self.weight = torch.nn.Parameter(
             torch.zeros(out_features, in_features, self.total_slots))
         self.register_buffer('_eligibility', torch.zeros(out_features, in_features, self.total_slots))
@@ -32,7 +46,6 @@ class Brain(torch.nn.Module):
         torch.nn.init.normal_(self.weight, mean=0.0, std=0.5)
 
     def _compute(self, x):
-        """Compute scores only (for forward/predict). No cell_out returned."""
         if x.dim() == 3 and x.shape[1] == 1:
             x = x.squeeze(1)
         raw = torch.sigmoid(x.unsqueeze(1).unsqueeze(-1) * self.weight.unsqueeze(0))
@@ -44,27 +57,44 @@ class Brain(torch.nn.Module):
         return self._compute(x)
 
     def get_cell_out(self, x):
-        """Compute per-cell output (for eligibility/update). Separate to manage memory."""
         if x.dim() == 3 and x.shape[1] == 1:
             x = x.squeeze(1)
         raw = torch.sigmoid(x.unsqueeze(1).unsqueeze(-1) * self.weight.unsqueeze(0))
         raw = raw * self._alive.unsqueeze(0).float()
         return raw
 
-    def update_eligibility(self, cell_out):
-        act = cell_out.mean(dim=0)
+    def update_eligibility(self, batch_cell_out):
+        """batch_cell_out: [batch, ...]"""
+        act = batch_cell_out.mean(dim=0)
         self._eligibility *= self.trace_decay
         self._eligibility += act * self._alive.float()
 
-    def apply_dopamine(self, dopamine):
-        if abs(dopamine) < 0.5:
+    def compute_td_error(self, current_accuracy):
+        """
+        TD error = actual - expected.
+        Positive: better than expected (dopamine surge)
+        Negative: worse than expected (dopamine dip)
+        """
+        td_error = current_accuracy - self.expected_accuracy
+
+        # Update expectation
+        self.expected_accuracy += self.td_alpha * td_error
+
+        return td_error
+
+    def apply_td_update(self, td_error):
+        """
+        Δw = lr * td_error * eligibility
+        td_error is a scalar (same for all cells).
+        """
+        if abs(td_error) < 0.005:  # tiny TD error, skip
             return
+
         with torch.no_grad():
-            delta = self.lr * dopamine * self._eligibility * self._alive.float()
-            # delta: [out_features, in_features, slots] — scalar per cell
-            self.weight.data.add_(delta * 0.05)
+            delta = self.lr * td_error * self._eligibility * self._alive.float()
+            self.weight.data.add_(delta * 1.0)  # scale=1.0 (no extra 0.05)
             self.weight.data.clamp_(-3.0, 3.0)
-            self._eligibility *= 0.5
+            self._eligibility *= 0.8  # partial reset
 
     def phase1_update(self, x, labels):
         if x.dim() == 3 and x.shape[1] == 1:
