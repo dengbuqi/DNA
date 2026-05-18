@@ -1,27 +1,23 @@
 """
-DNA v3 Trainer — Overproduction + Energy Budget.
+DNA v4 Trainer — No backpropagation, pure local learning.
 
 Training loop:
-  1. Forward pass (BCE + backprop — standard PyTorch)
-  2. Track activations per cell
-  3. Epoch end: energy update, structural update (split rich, remove dead)
+  1. Forward pass (no grad)
+  2. Local weight update (Δw = lr * x * (target - output))
+  3. Energy update
+  4. Structural update (kill/split)
+  5. No loss.backward(), no optimizer
 """
 
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
 from torchvision import datasets, transforms
 from model import Brain
 
 
 args = {
     'batch_size': 256,
-    'epochs': 20,
+    'epochs': 10,
     'lr': 0.01,
-    'momentum': 0.5,
-    'patience': 3,
-    'initial_cells': 10,
-    'max_cells': 32,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -43,37 +39,7 @@ test_loader = torch.utils.data.DataLoader(
                        transforms.Normalize((0.1307,), (0.3081,)),
                        torch.nn.Flatten(),
                    ])),
-    batch_size=args['test_batch_size'] if 'test_batch_size' in args else 1000,
-    shuffle=False, num_workers=0)
-
-
-def train_epoch(epoch, model, optimizer):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total_samples = 0
-
-    for data, target in train_loader:
-        data, target = data.to(device), target.to(device)
-
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.binary_cross_entropy(output, F.one_hot(target, 10).float())
-        loss.backward()
-        optimizer.step()
-
-        # Track cell activations for energy update
-        model.track_activations(data)
-
-        total_loss += loss.item() * data.size(0)
-        pred = output.argmax(dim=1)
-        correct += pred.eq(target).sum().item()
-        total_samples += data.size(0)
-
-    avg_loss = total_loss / total_samples
-    accuracy = 100. * correct / total_samples
-    print(f'[Epoch {epoch}] Loss: {avg_loss:.4f} Acc: {accuracy:.2f}%')
-    return avg_loss
+    batch_size=1000, shuffle=False, num_workers=0)
 
 
 def test(model):
@@ -83,8 +49,8 @@ def test(model):
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            output = model(data)
-            pred = output.argmax(dim=1)
+            scores = model(data)
+            pred = model.predict(scores)
             correct += pred.eq(target).sum().item()
             total += data.size(0)
     return 100. * correct / total
@@ -92,23 +58,40 @@ def test(model):
 
 if __name__ == '__main__':
     model = Brain(
-        in_features=784, out_features=10,
-        initial_cells=args['initial_cells'],
-        max_cells=args['max_cells'],
+        in_features=784, out_features=10, cells_per_class=3,
+        lr=args['lr'],
     ).to(device)
-    print(f'Initial alive cells: {model.get_n_cells()}')
 
-    optimizer = optim.SGD(model.parameters(), lr=args['lr'], momentum=args['momentum'])
+    print(f'Alive cells: {model.get_n_cells()}')
+    print(f'Parameters: {sum(p.numel() for p in model.parameters())}')
+    print()
 
     for epoch in range(1, args['epochs'] + 1):
-        train_epoch(epoch, model, optimizer)
+        model.train()
+        correct = 0
+        total = 0
+
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+
+            # Forward
+            scores = model(data)
+
+            # Local learning (no BP!)
+            model.local_update(data, target)
+
+            # Track accuracy
+            pred = model.predict(scores)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
 
         # Energy + structural update
-        model.update_energy()
+        model.update_energy(data, target)
         model.structural_update()
 
-        print(f'  [Arch] Alive cells: {model.get_n_cells()}')
+        print(f'[Epoch {epoch}] Train Acc: {100.*correct/total:.2f}% '
+              f'Alive: {model.get_n_cells()}')
 
         test_acc = test(model)
-        print(f'  [Test] Acc: {test_acc:.2f}%')
+        print(f'[Epoch {epoch}] Test Acc: {test_acc:.2f}%')
         print()
