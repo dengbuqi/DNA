@@ -1,8 +1,8 @@
 """
-DNA v13 trainer — Full-image receptive fields, pure Hebbian.
+DNA v15 trainer — Nonlinear cells + WTA + Hebbian gain/bias.
 """
 
-import torch, gc, sys, os
+import torch, gc
 from torchvision import datasets, transforms
 from model import Brain
 
@@ -13,12 +13,17 @@ args = {
     'lr': 0.01,
     'lr_decay': 0.5,
     'patience': 3,
-    'cells_per_class': 3,
+    'cells_per_class': 8,
     'max_cells_per_class': 32,
     'energy_cost': 2.0,
     'measure_causal': True,
     'extinction': True,
     'extinction_interval': 10,
+    'wta_k': 1,
+    'wta_anneal_start': 5,
+    'wta_anneal_end': 20,
+    'gain_lr': 0.005,
+    'bias_lr': 0.005,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -62,19 +67,24 @@ if __name__ == '__main__':
         max_cells_per_class=args['max_cells_per_class'],
         lr=args['lr'],
         base_cost=args['energy_cost'],
+        wta_k=args['wta_k'],
+        wta_anneal_start=args['wta_anneal_start'],
+        wta_anneal_end=args['wta_anneal_end'],
+        gain_lr=args['gain_lr'],
+        bias_lr=args['bias_lr'],
     ).to(device)
 
     total_cells = model.get_n_cells()
     print(f'\nInitial: {total_cells} cells = {total_cells / 10:.1f} per class\n')
 
-    # ─── Training: Pure Hebbian with LR annealing ───
-    print('=== Training: Local Hebbian ===')
+    print('=== Training: Hebbian + Nonlinear + WTA ===')
     best_test = 0.0
     plateau_count = 0
     current_lr = args['lr']
 
     for ep in range(args['epochs']):
         model.lr = current_lr
+        model.epoch = ep
         cor = 0
         tot = 0
         for d, t in train_loader:
@@ -95,16 +105,16 @@ if __name__ == '__main__':
                 current_lr *= args['lr_decay']
                 plateau_count = 0
 
+        k = model._get_wta_k(model.max_C)
         if args['measure_causal']:
             model.measure_all_causal()
             model.update_energy(d, t)
             model.structural_update()
-            print(f'  ep{ep+1:2d} Train: {tr*100:.2f}% Test: {te*100:.2f}% lr={current_lr:.5f} cells={model.get_n_cells()}')
+            print(f'  ep{ep+1:2d} Train: {tr*100:.2f}% Test: {te*100:.2f}% lr={current_lr:.5f} cells={model.get_n_cells()} WTA_k={k}')
         else:
-            print(f'  ep{ep+1:2d} Train: {tr*100:.2f}% Test: {te*100:.2f}% lr={current_lr:.5f}')
+            print(f'  ep{ep+1:2d} Train: {tr*100:.2f}% Test: {te*100:.2f}% lr={current_lr:.5f} WTA_k={k}')
 
         if args['extinction'] and (ep + 1) % args['extinction_interval'] == 0:
-            model.epoch = ep
             model.extinction()
 
     print(f'\nBest test: {best_test*100:.2f}%')
