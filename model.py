@@ -23,9 +23,14 @@ import torch.nn.functional as F
 
 class Brain(torch.nn.Module):
     def __init__(self, in_features=784, out_features=10, cells_per_class=8,
-                 max_cells_per_class=32, lr=0.01, base_cost=2.0,
-                 wta_k=1, wta_anneal_start=5, wta_anneal_end=20,
-                 gain_lr=0.001, bias_lr=0.001):
+                 max_cells_per_class=32, lr=0.01, base_cost=0.5,
+                 wta_k=1, wta_anneal_start=150, wta_anneal_end=500,
+                 gain_lr=0.002, bias_lr=0.002,
+                 extinction_mode='topk', extinction_keep=3):
+        """
+        extinction_mode: 'median' (old) or 'topk' (keep top N cells per class)
+        extinction_keep: how many cells to keep per class per extinction
+        """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -36,6 +41,8 @@ class Brain(torch.nn.Module):
         self.base_cost = base_cost
         self.gain_lr = gain_lr
         self.bias_lr = bias_lr
+        self.extinction_mode = extinction_mode
+        self.extinction_keep = extinction_keep
         self.wta_k = wta_k
         self.wta_anneal_start = wta_anneal_start
         self.wta_anneal_end = wta_anneal_end
@@ -275,7 +282,7 @@ class Brain(torch.nn.Module):
             self._grace = (self._grace - 1).clamp(min=0)
 
     def extinction(self):
-        print(f'[Extinction] epoch {self.epoch} | cells={self.get_n_cells()}')
+        print(f'[Extinction] epoch {self.epoch} | cells={self.get_n_cells()} mode={self.extinction_mode}')
         with torch.no_grad():
             for c in range(self.out_features):
                 alive = torch.where(self._alive[c])[0]
@@ -291,13 +298,30 @@ class Brain(torch.nn.Module):
                             self.gain.data[c, ni] = 1.0
                             self.bias.data[c, ni] = 0.0
                     continue
-                imp = self._causal_imp[c, alive]
-                median = imp.median().item()
-                keep = imp >= median
-                kill_indices = alive[~keep]
-                self._alive[c, kill_indices] = False
-                for idx in alive[keep]:
-                    self._energy[c, idx] /= 2
+
+                if self.extinction_mode == 'topk':
+                    # Keep top-k cells by causal importance, kill rest
+                    imp = self._causal_imp[c, alive]
+                    k = min(self.extinction_keep, len(alive))
+                    topk_vals, topk_idx = imp.topk(k)
+                    keep = alive[topk_idx]
+                    kill_indices = alive[~torch.isin(alive, keep)]
+                    self._alive[c, kill_indices] = False
+                    for idx in keep:
+                        self._energy[c, idx] /= 2
+                        self._causal_imp[c, idx] = 0.0
+                        self._imp_count[c, idx] = 0
+                else:
+                    # Original median mode
+                    imp = self._causal_imp[c, alive]
+                    median = imp.median().item()
+                    keep = imp >= median
+                    kill_indices = alive[~keep]
+                    self._alive[c, kill_indices] = False
+                    for idx in alive[keep]:
+                        self._energy[c, idx] /= 2
+                        self._causal_imp[c, idx] = 0.0
+                        self._imp_count[c, idx] = 0
         self.extinction_interval += 2
 
     def predict(self, scores):

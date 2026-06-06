@@ -13,11 +13,11 @@ args = {
     'lr': 0.005,
     'lr_decay': 0.97,
     'cells_per_class': 8,
-    'max_cells_per_class': 64,
+    'max_cells_per_class': 32,
     'energy_cost': 0.5,
     'measure_causal': True,
     'extinction': True,
-    'extinction_interval': 1000,
+    'extinction_interval': 5000,
     'wta_k': 1,
     'wta_anneal_start': 150,
     'wta_anneal_end': 500,
@@ -26,7 +26,9 @@ args = {
     'eval_every': 100,
     'replay_ratio': 0.5,
     'replay_buffer_size': 20000,
-    'total_updates': 20000,
+    'total_updates': 30000,
+    'extinction_mode': 'topk',
+    'extinction_keep': 12,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -66,6 +68,8 @@ if __name__ == '__main__':
         wta_anneal_end=args['wta_anneal_end'],
         gain_lr=args['gain_lr'],
         bias_lr=args['bias_lr'],
+        extinction_mode=args['extinction_mode'],
+        extinction_keep=args['extinction_keep'],
     ).to(device)
 
     train_loader, test_loader, train_dataset, _ = make_loaders()
