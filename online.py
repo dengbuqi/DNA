@@ -27,7 +27,7 @@ args = {
     'replay_ratio': 0.5,
     'replay_buffer_size': 20000,
     'total_updates': 30000,
-    'extinction_mode': 'topk',
+    'extinction_mode': 'soft_energy',
     'extinction_keep': 12,
 }
 

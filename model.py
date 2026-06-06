@@ -311,6 +311,19 @@ class Brain(torch.nn.Module):
                         self._energy[c, idx] /= 2
                         self._causal_imp[c, idx] = 0.0
                         self._imp_count[c, idx] = 0
+                elif self.extinction_mode == 'soft_energy':
+                    # Soft extinction: don't kill cells.
+                    # Instead, halve the learning rate of low-importance cells
+                    # so they slowly fade while important cells keep learning.
+                    # This avoids the hard reset that kills knowledge.
+                    imp = self._causal_imp[c, alive]
+                    median = imp.median().item()
+                    for idx in alive:
+                        if self._causal_imp[c, idx].item() < median:
+                            self._energy[c, idx] *= 0.3  # drain energy, will die slowly
+                        else:
+                            self._energy[c, idx] /= 2
+                        self._causal_imp[c, idx] = 0.0
                 else:
                     # Original median mode
                     imp = self._causal_imp[c, alive]
