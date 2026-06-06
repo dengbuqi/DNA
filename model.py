@@ -51,6 +51,8 @@ class Brain(torch.nn.Module):
         # Two weight sets per cell
         self.w1 = torch.nn.Parameter(torch.zeros(out_features, self.total_slots, in_features))
         self.w2 = torch.nn.Parameter(torch.zeros(out_features, self.total_slots, in_features))
+        # w2 bias: ensures w2·x + bias > 0 so ln branch is never negative
+        self.w2_bias = torch.nn.Parameter(torch.ones(out_features, self.total_slots))
 
         self.register_buffer('_energy', torch.full(
             (out_features, self.total_slots), 100.0, dtype=torch.float))
@@ -69,7 +71,9 @@ class Brain(torch.nn.Module):
         self.extinction_interval = 10
 
     def _init_weights(self):
+        # w1: mean=0
         torch.nn.init.normal_(self.w1, mean=0.0, std=0.5 / (self.in_features ** 0.5))
+        # w2: mean=0 keeps diversity
         torch.nn.init.normal_(self.w2, mean=0.0, std=0.5 / (self.in_features ** 0.5))
 
     def _cell_output(self, x):
@@ -80,6 +84,7 @@ class Brain(torch.nn.Module):
         p = x.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, in_features]
         l1 = (p * self.w1.unsqueeze(0)).sum(dim=-1)
         l2 = (p * self.w2.unsqueeze(0)).sum(dim=-1)
+        l2 = l2 + self.w2_bias.unsqueeze(0)  # ensure positive, [B, out, slots]
         raw = torch.sigmoid(eml(l1, l2))
         return raw * self._alive.unsqueeze(0).float()
 
@@ -116,6 +121,7 @@ class Brain(torch.nn.Module):
             p = x.unsqueeze(1).unsqueeze(2)
             l1 = (p * self.w1.unsqueeze(0)).sum(dim=-1)
             l2 = (p * self.w2.unsqueeze(0)).sum(dim=-1)
+            l2 = l2 + self.w2_bias.unsqueeze(0)  # ensure positive
             l2_safe = l2.clamp(min=1e-10)
             output = torch.sigmoid(eml(l1, l2_safe))
             output = output * self._alive.unsqueeze(0).float()
@@ -137,6 +143,12 @@ class Brain(torch.nn.Module):
             dw2 = dw2 * self._alive.unsqueeze(0).unsqueeze(-1).float()
             self.w2.data.add_(dw2.mean(dim=0))
             self.w2.data.clamp_(-3.0, 3.0)
+
+            # Δw2_bias = lr * w2_scale * error * sig' * (-1/l₂) * 1
+            # (same as Δw2 but without x — bias has gradient 1)
+            dbias = (self.lr * self.w2_scale * (error * sig_prime * inv_part)).mean(dim=0)
+            self.w2_bias.data.add_(dbias)
+            self.w2_bias.data.clamp_(0.1, 10.0)
 
     # ==================== Causal importance ====================
 

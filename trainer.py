@@ -8,7 +8,7 @@ from model import Brain
 
 args = {
     'batch_size': 256,
-    'epochs': 50,
+    'epochs': 100,
     'lr': 0.005,
     'lr_decay': 0.5,
     'patience': 4,
