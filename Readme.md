@@ -37,7 +37,7 @@ DNA 是一个基于生物神经科学原理构建的神经网络框架。它的�
 | v4 单像素 Hebbian (15 epoch) | 70.74% | 单像素逻辑回归上限 |
 | v13 全图连接 + Extinction | **91.70%** 🏆 | 30 细胞，无非线性，无 WTA |
 | **v15 非线性 + WTA** | **91.76%** 🥇 | **批量训练最佳**，Hebbian 置信度 + 稳态 + 退火 WTA |
-| **v17 EML 细胞** | **90.53%** | exp(w₁·x) − ln(w₂·x) 纯局部 Hebbian，逼近 sigmoid |
+| **v17 EML 细胞** | **90.53% 批量 / 89.71% 在线** | exp(w₁·x) − ln(w₂·x) 纯局部 Hebbian，逼近 sigmoid |
 
 ### 在线学习（推演+学习同时进行）
 
@@ -54,6 +54,7 @@ DNA 是一个基于生物神经科学原理构建的神经网络框架。它的�
 | + topk extinction | keep=12, interval=5000 | 87.09% | 有效杀细胞，但 peak 递减 |
 | + soft_energy extinction 🏆 | drain 低重要性 energy | 88.82% | 稳定，3 次后不衰退 |
 | **+ max_C=64 + 无 WTA** | **640 细胞全投票** | **91.08%** 🎯 | **在线学习达成 91% 目标！** |
+| **v17 EML 细胞在线** | **exp(w₁·x) - ln(w₂·x)** | **89.71%** | **EML 在线验证，慢但稳定** |
 
 ### 关键发现：细胞数量是关键
 
@@ -179,7 +180,7 @@ python online.py
 
 6. **Soft Energy Extinction** 是最好的在线 extinction。不杀细胞、只 drain 能量，保留权重知识，多次 extinction 后准确率几乎不衰退。
 
-7. **EML 算子可替代 sigmoid**。exp(w₁·x) − ln(w₂·x) 在纯局部 Hebbian 下达到 90.53%，逼近 sigmoid 的 90.65%。w₂ bias 是关键——保障 ln 分支输入为正，否则半数细胞初始即死。
+7. **EML 算子可替代 sigmoid**。exp(w₁·x) − ln(w₂·x) 在纯局部 Hebbian 下达到 **90.53%（批量）/ 89.71%（在线）**，逼近 sigmoid 的 90.65%/91.08%。在线模式下 EML 收敛较慢（−1.4%），但在批量训练中差距仅 0.12%。w₂ bias 是关键——保障 ln 分支输入为正，否则半数细胞初始即死。
 
 ---
 
