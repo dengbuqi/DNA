@@ -1,5 +1,5 @@
 """
-DNA online — 连续学习 + replay buffer.
+DNA v17 online — EML cells (exp(w₁·x) - ln(w₂·x)) continuous learning.
 """
 
 import torch, gc
@@ -12,23 +12,20 @@ args = {
     'batch_size': 128,
     'lr': 0.005,
     'lr_decay': 0.97,
-    'cells_per_class': 8,
+    'cells_per_class': 16,
     'max_cells_per_class': 64,
     'energy_cost': 0.5,
     'measure_causal': True,
     'extinction': True,
     'extinction_interval': 5000,
-    'wta_k': 999,
-    'wta_anneal_start': 999,
-    'wta_anneal_end': 999,
-    'gain_lr': 0.002,
-    'bias_lr': 0.002,
+    'extinction_mode': 'soft_energy',
+    'extinction_keep': 24,
     'eval_every': 100,
     'replay_ratio': 0.5,
     'replay_buffer_size': 20000,
     'total_updates': 30000,
-    'extinction_mode': 'soft_energy',
-    'extinction_keep': 24,
+    'w1_scale': 0.1,
+    'w2_scale': 3.0,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -41,7 +38,7 @@ def make_loaders():
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),
-        torch.nn.Flatten()])
+        lambda x: x.flatten()])
 
     train_dataset = datasets.MNIST(DATA_PATH, train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST(DATA_PATH, train=False, transform=transform)
@@ -63,13 +60,10 @@ if __name__ == '__main__':
         max_cells_per_class=args['max_cells_per_class'],
         lr=args['lr'],
         base_cost=args['energy_cost'],
-        wta_k=args['wta_k'],
-        wta_anneal_start=args['wta_anneal_start'],
-        wta_anneal_end=args['wta_anneal_end'],
-        gain_lr=args['gain_lr'],
-        bias_lr=args['bias_lr'],
         extinction_mode=args['extinction_mode'],
         extinction_keep=args['extinction_keep'],
+        w1_scale=args['w1_scale'],
+        w2_scale=args['w2_scale'],
     ).to(device)
 
     train_loader, test_loader, train_dataset, _ = make_loaders()
@@ -85,7 +79,7 @@ if __name__ == '__main__':
                 tot += d.size(0)
         return cor / tot * 100
 
-    # Build replay buffer (images stored as flat tensors)
+    # Build replay buffer
     replay_size = min(args['replay_buffer_size'], len(train_dataset))
     all_indices = list(range(len(train_dataset)))
     random.shuffle(all_indices)
@@ -94,14 +88,14 @@ if __name__ == '__main__':
         x, y = train_dataset[i]
         replay_buffer.append((x.flatten(), y))
 
-    print(f'\nInitial: {model.get_n_cells()} cells')
+    print(f'\nInitial: {model.get_n_cells()} cells (EML)')
     print(f'Replay buffer: {len(replay_buffer)} samples')
     print('Continuous learning with replay\n')
 
     print(f'{"step":>6} | {"stream_acc":>8} | {"test_acc":>8} | {"cells":>5}')
     print('-' * 50)
 
-    # Pre-load all new data as a big shuffled list
+    # Pre-load new data
     new_data = []
     for d, t in train_loader:
         for i in range(len(d)):
@@ -163,8 +157,7 @@ if __name__ == '__main__':
                 best_test = test_acc
             else:
                 current_lr *= args['lr_decay']
-            k = model._get_wta_k(model.max_C)
-            print(f'{step+1:>6} | {stream_acc:>7.2f}% | {test_acc:>7.2f}% | {model.get_n_cells():>5} | WTA_k={k}')
+            print(f'{step+1:>6} | {stream_acc:>7.2f}% | {test_acc:>7.2f}% | {model.get_n_cells():>5}')
 
     test_acc = test()
     if test_acc > best_test:
