@@ -13,14 +13,14 @@ args = {
     'lr': 0.005,
     'lr_decay': 0.97,
     'cells_per_class': 8,
-    'max_cells_per_class': 32,
+    'max_cells_per_class': 64,
     'energy_cost': 0.5,
     'measure_causal': True,
     'extinction': True,
     'extinction_interval': 5000,
-    'wta_k': 1,
-    'wta_anneal_start': 150,
-    'wta_anneal_end': 500,
+    'wta_k': 999,
+    'wta_anneal_start': 999,
+    'wta_anneal_end': 999,
     'gain_lr': 0.002,
     'bias_lr': 0.002,
     'eval_every': 100,
@@ -28,7 +28,7 @@ args = {
     'replay_buffer_size': 20000,
     'total_updates': 30000,
     'extinction_mode': 'soft_energy',
-    'extinction_keep': 12,
+    'extinction_keep': 24,
 }
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
